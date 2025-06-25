@@ -1,0 +1,20 @@
+# Numeric & build dependencies first
+numpy
+cython
+
+# Imaging & data science stack
+pandas
+matplotlib
+openpyxl
+jupyter
+
+pydicom
+SimpleITK
+scikit-image
+scikit-learn
+
+# Deep learning
+torch
+
+# Radiomics
+pyradiomics
