@@ -18,3 +18,4 @@ torch
 
 # Radiomics
 pyradiomics
+tqdm

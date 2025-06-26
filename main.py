@@ -1,11 +1,17 @@
+# Updated main.py with SimpleITK-based DICOM I/O to avoid PixelData errors
+
 import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
-import pydicom                  # for DICOM I/O
+import SimpleITK as sitk
 import numpy as np
 from skimage.filters import threshold_otsu
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
+from radiomics import featureextractor
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report, roc_curve
 
 # ── 1. Load metadata and labels ────────────────────────────────────────────────
 metadata_path = 'D:/Dataset/manifest-1542731172463/metadata.csv'
@@ -54,7 +60,7 @@ train_subj, test_subj = train_test_split(
     random_state=42
 )
 
-# ── 7. Dataset class ──────────────────────────────────────────────────────────
+# ── 7. Dataset class with SimpleITK for robust I/O ────────────────────────────
 class RadiomicsDataset(Dataset):
     def __init__(self, df, subj_list, transform=None):
         self.df = df[df['SubjectID'].isin(subj_list)].reset_index(drop=True)
@@ -67,21 +73,31 @@ class RadiomicsDataset(Dataset):
         row = self.df.iloc[idx]
         loc = row['FileLocation']
 
-        # If it's a directory, pick first .dcm
+        # If it's a directory, read the full series and take the first slice
         if os.path.isdir(loc):
-            files = [f for f in os.listdir(loc) if f.lower().endswith('.dcm')]
-            loc = os.path.join(loc, files[0])
+            reader = sitk.ImageSeriesReader()
+            series_files = reader.GetGDCMSeriesFileNames(loc)
+            reader.SetFileNames(series_files)
+            volume = reader.Execute()
+            arr = sitk.GetArrayFromImage(volume)  # shape [slices, H, W]
+            img = arr[0].astype(np.float32)
+        else:
+            # Single-file DICOM
+            sitk_img = sitk.ReadImage(loc)
+            arr = sitk.GetArrayFromImage(sitk_img)
+            if arr.ndim == 3:
+                img = arr[0].astype(np.float32)
+            else:
+                img = arr.astype(np.float32)
 
-        ds  = pydicom.dcmread(loc)
-        img = ds.pixel_array.astype(np.float32)
-
+        # Generate Otsu mask
         thresh = threshold_otsu(img)
-        mask   = (img > thresh).astype(np.uint8)
+        mask = (img > thresh).astype(np.uint8)
 
         sample = {
-            'image': img,
-            'mask':  mask,
-            'label': row['label'],
+            'image':   img,
+            'mask':    mask,
+            'label':   row['label'],
             'subject': row['SubjectID']
         }
         return self.transform(sample) if self.transform else sample
@@ -94,24 +110,15 @@ print("Train slices:", len(train_ds))
 print(" Test slices:", len(test_ds))
 
 s = train_ds[0]
-print(" Keys:",  s.keys())
-print(" Shape:", s['image'].shape, "Mask vals:", np.unique(s['mask']), "Label:", s['label'])
+print("Keys:",  s.keys())
+print("Shape:", s['image'].shape, "Mask vals:", np.unique(s['mask']), "Label:", s['label'])
 
 plt.figure(figsize=(6,3))
 plt.subplot(1,2,1); plt.imshow(s['image'], cmap='gray');    plt.title('Image');    plt.axis('off')
 plt.subplot(1,2,2); plt.imshow(s['mask'],  cmap='gray');    plt.title('Otsu mask'); plt.axis('off')
 plt.show()
 
-for p in train_ds.df['FileLocation'].sample(5):
-    entry = p if p.lower().endswith('.dcm') else os.path.join(p, os.listdir(p)[0])
-    assert os.path.exists(entry), f"Missing file: {entry}"
-
-# ── 9. Radiomics feature extraction ────────────────────────────────────────────
-from radiomics import featureextractor
-import SimpleITK as sitk
-import tqdm
-
-# Configure extractor (tweak binWidth, spacing, etc. as needed)
+# ── 9. Radiomics feature extraction (train) ───────────────────────────────────
 params = {
     'binWidth': 25,
     'resampledPixelSpacing': None,
@@ -120,24 +127,77 @@ params = {
 }
 extractor = featureextractor.RadiomicsFeatureExtractor(**params)
 
-records = []
-for i in tqdm.tqdm(range(len(train_ds)), desc="Extracting radiomics"):
+train_records = []
+for i in range(len(train_ds)):
     sample = train_ds[i]
-
-    # Convert back to SimpleITK images
     sitk_img  = sitk.GetImageFromArray(sample['image'])
     sitk_mask = sitk.GetImageFromArray(sample['mask'])
-
     feats = extractor.execute(sitk_img, sitk_mask)
-
     rec = {'subject': sample['subject'], 'label': sample['label']}
     for k, v in feats.items():
         if k.startswith('original_'):
             rec[k] = v
-    records.append(rec)
+    train_records.append(rec)
 
-features_df = pd.DataFrame(records)
-features_df.to_csv('train_radiomics_features.csv', index=False)
+train_features_df = pd.DataFrame(train_records)
+train_features_df.to_csv('train_radiomics_features.csv', index=False)
 print("Saved features to train_radiomics_features.csv")
 
-# Repeat for test set if desired…
+# ── 10. Radiomics feature extraction (test) ────────────────────────────────────
+test_records = []
+for i in range(len(test_ds)):
+    sample = test_ds[i]
+    sitk_img  = sitk.GetImageFromArray(sample['image'])
+    sitk_mask = sitk.GetImageFromArray(sample['mask'])
+    feats = extractor.execute(sitk_img, sitk_mask)
+    rec = {'subject': sample['subject'], 'label': sample['label']}
+    for k, v in feats.items():
+        if k.startswith('original_'):
+            rec[k] = v
+    test_records.append(rec)
+
+test_features_df = pd.DataFrame(test_records)
+test_features_df.to_csv('test_radiomics_features.csv', index=False)
+print("Saved features to test_radiomics_features.csv")
+
+# ── 11. Train classifier with cross-validation ────────────────────────────────
+X_train = train_features_df.drop(['subject','label'], axis=1)
+y_train = train_features_df['label']
+X_test  = test_features_df.drop(['subject','label'], axis=1)
+y_test  = test_features_df['label']
+
+rf = RandomForestClassifier(random_state=42)
+param_grid = {
+    'n_estimators': [100, 200],
+    'max_depth': [None, 10, 20],
+    'min_samples_leaf': [1, 2, 4]
+}
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+grid = GridSearchCV(rf, param_grid, cv=cv, scoring='roc_auc', n_jobs=-1)
+grid.fit(X_train, y_train)
+
+print("Best params:", grid.best_params_)
+print("CV AUC:   ", grid.best_score_)
+
+# ── 12. Evaluate on test set ───────────────────────────────────────────────────
+best_rf = grid.best_estimator_
+y_pred_proba = best_rf.predict_proba(X_test)[:,1]
+y_pred       = best_rf.predict(X_test)
+
+auc = roc_auc_score(y_test, y_pred_proba)
+print(f"Test ROC AUC: {auc:.3f}")
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred))
+
+# ── 13. Plot ROC curve ────────────────────────────────────────────────────────
+fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+plt.figure()
+plt.plot(fpr, tpr, label=f'AUC = {auc:.3f}')
+plt.plot([0,1], [0,1], linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend(loc='lower right')
+plt.show()
