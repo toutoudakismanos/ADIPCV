@@ -19,3 +19,5 @@ torch
 # Radiomics
 pyradiomics
 tqdm
+
+xgboost
