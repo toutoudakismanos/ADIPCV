@@ -1,1 +1,10 @@
 .env
+test
+test.py
+LogReg_L1_patient_model.pkl
+patient_level_roc.png
+patient_model.pkl
+pca.pkl
+rf_slice_model.pkl
+roc_curve.png
+sanity_check.png
